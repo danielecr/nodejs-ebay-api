@@ -125,6 +125,25 @@ var buildRequestUrl = function buildRequestUrl(serviceName, params, filters, san
 };
 module.exports.buildRequestUrl = buildRequestUrl;
 
+var XMLSerializer = require('xmldom').XMLSerializer;
+
+var buildXmlFromXml = function(params) {
+	if (params.hasXml != true && params.XMLnode == undefined) {
+		return ''; // or throw error
+	}
+	var node = params.XMLnode;
+
+	var doc2 = node.ownerDocument;
+	var cred=doc2.createElement("RequesterCredentials");
+	var auth=doc2.createElement("eBayAuthToken");
+	var t=doc2.createTextNode(params.authToken);
+	auth.appendChild(t);
+	cred.appendChild(auth);
+	node.appendChild(cred);
+
+	var xmlString = new XMLSerializer().serializeToString(node);
+	return '<?xml version="1.0" encoding="UTF-8"?>' + "\n" + xmlString;
+};
 
 
 // build XML input for XML-POST requests
@@ -137,6 +156,9 @@ module.exports.buildRequestUrl = buildRequestUrl;
 // for repeatable fields, use an array value (see below)
 //
 var buildXmlInput = function buildXmlInput(opType, params) {
+	if (params.hasXml == true && params.XMLnode != undefined) {
+		return buildXmlFromXml(params);
+	}
   var xmlBuilder = require('xml');
   
   var data = {}, top;
@@ -154,22 +176,77 @@ var buildXmlInput = function buildXmlInput(opType, params) {
     top.push({ 'RequesterCredentials' : [ { 'eBayAuthToken' : params.authToken } ] });
     delete params.authToken;
   }
-  
-  // for repeatable fields, use array values.
-  // to keep this simpler, treat everything as an array value.
-  _(params).each(function(values, key) {
-    if (!_.isArray(values)) values = [values];
-    
-    _(values).each(function(value){
-      var el = {};
-      el[key] = value;
-      top.push(el);      
-    });
-  });
+  var usexml2json = false;
+  if (typeof params.from_xml2json !== 'undefined') {
+	  if(params.from_xml2json) usexml2json = true;
+	  delete params.from_xml2json;
+  }
+  var cdataexpr = false;
+  var rexpr = undefined;
+  if (typeof params.transformToCDATA !== 'undefined') {
+	  cdataexpr = true;
+	  rexpr = params.transformToCDATA;
+	  delete params.transformToCDATA;
+  }
 
-  // console.log(util.inspect(data,true,10));
+  // This is a recursive version (that work with xml2json)
+  function convertObjToArray(value) {
+	  if(typeof value == 'object') {
+		  if (!_.isArray(value)) {
+			  values = [value];
+		  }
+		  var theArr = [];
+		  _(value).each(function(v, key){
+			  if (_.isArray(v)) {
+				  _(v).each(function(v){
+					  var el = {};
+					  el[key] = convertObjToArray(v);
+					  theArr.push(el);
+				  });
+			  } else {
+				  var el = {};
+				  el[key] = convertObjToArray(v);
+				  theArr.push(el);
+			  }
+		  });
+		  return theArr;
+	  } else {
+		  if(typeof value == 'string' && cdataexpr && rexpr.test(value)) {
+			  return {_cdata:value};
+		  }
+		  return value;
+	  }
+  }
+  if(usexml2json) {
+	  var others = convertObjToArray(params);
+	  _(others).each(function(values,key) {
+		  top.push(values);
+	  });
+  } else {
+	  //for repeatable fields, use array values.
+	  // to keep this simpler, treat everything as an array value.
+	  _(params).each(function(values, key) {
+		  if (!_.isArray(values)) values = [values];
+
+		  _(values).each(function(value){
+			  var el = {};
+			  if (_.isObject(value)) {
+				  el[key] = [];
+				  _(value).each(function(values2, key2) {
+					  var el2 = {};
+					  el2[key2] = values2;
+					  el[key].push(el2);
+				  });
+			  } else {
+				  el[key] = value;
+			  }
+			  top.push(el);
+		  });
+	  });
+  }
+
+  //console.log(util.inspect(data,true,10));
   data = [ data ];
-
   return '<?xml version="1.0" encoding="UTF-8"?>' + "\n" + xmlBuilder(data, true);
 };
 
@@ -222,7 +299,9 @@ var defaultParams = function defaultParams(options) {
     case 'Trading':
       params = {
         'X-EBAY-API-CALL-NAME' : options.opType,
-        'X-EBAY-API-COMPATIBILITY-LEVEL' : '775',
+        //'X-EBAY-API-COMPATIBILITY-LEVEL' : '775',
+        'X-EBAY-API-COMPATIBILITY-LEVEL' : '863',
+        //'X-EBAY-API-COMPATIBILITY-LEVEL' : '791',
         'X-EBAY-API-SITEID' : '0', // US
         'X-EBAY-API-DEV-NAME': options.devName,
         'X-EBAY-API-CERT-NAME': options.cert,
@@ -368,23 +447,29 @@ var ebayApiPostXmlRequest = function ebayApiPostXmlRequest(options, callback) {
   // console.log('URL:', url);
   
   options.reqOptions.data = buildXmlInput(options.opType, options.params);
-  // console.log(options.reqOptions.data);
-  
+  if (module.exports.dumpXmlRequest) console.log('DUMP of XML REQUEST: ',options.reqOptions.data);
+
   var request = restler.post(url, options.reqOptions);
   
   request.once('complete', function(result, response) {
     if (result instanceof Error) {
       var error = result;
       error.message = "Completed with error: " + error.message;
-      return callback(error);
+      callback(error);
+	return true;
     }
     else if (response.statusCode !== 200) {
-      return callback(new Error(util.format("Bad response status code", response.statusCode, result.toString())));
+      callback(new Error(util.format("Bad response status code", response.statusCode, result.toString())));
+	return true;
     }
     
     // raw XML wanted?
     if (options.rawXml) {
-      return callback(null, result);
+	var resp = {reqData: options.reqOptions.data,
+		reqHeaders: options.reqOptions.headers,
+		resXml: result};
+      callback(null, resp);
+	return true;
     }
 
     async.waterfall([
@@ -628,7 +713,7 @@ module.exports.checkAffiliateUrl = function checkAffiliateUrl(url) {
   return (regexAffil.test(url) && !regexNonAffil.test(url) && regexCampaign.test(url));
 };
 
-
+module.exports.dumpXmlRequest = false;
 
 // check the latest API versions (to update the code accordingly)
 // callback gets hash of APIs:versions

@@ -106,6 +106,10 @@ and can optionally contain:
 
 `callback` gets `(error, data)`. (There is not currently a default parser for these endpoints.)
 
+### `ebayApiPostXmlRequest(options, callback)` *new feature*
+
+If options.params.hasXml is defined and has value true, and options.params.XMLnode is defined as an xml node, then that is used to serialize the xml to send to ebay api, adding authToken passed in params.
+
 
 ## Helpers
 
